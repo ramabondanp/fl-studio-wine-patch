@@ -1,0 +1,133 @@
+--- a/dlls/crypt32/msg.c
++++ b/dlls/crypt32/msg.c
+@@ -962,6 +962,7 @@
+ {
+     HCRYPTHASH contentHash;
+     HCRYPTHASH authAttrHash;
++    CRYPT_DATA_BLOB encodedAuthAttrs;
+ } CSignerHandles;
+ 
+ typedef struct _CSignedMsgData
+@@ -1030,6 +1031,61 @@
+     return ret;
+ }
+ 
++/* Keep the received signed attributes, not a sorted re-encoding. The signature
++ * covers their original encoding with the implicit [0] tag replaced by SET OF.
++ * All temporary decodes own their bytes; no pointers into the input survive.
++ */
++static BOOL CSignedMsgData_SaveAuthenticatedAttributes(CSignedMsgData *msg_data,
++ const CRYPT_DER_BLOB *blob)
++{
++    CRYPT_SEQUENCE_OF_ANY *fields = NULL, *signers = NULL, *signer = NULL;
++    CRYPT_DER_BLOB *encoded;
++    DWORD i, size;
++    BOOL ret = FALSE;
++
++    if (!msg_data->info->cSignerInfo) return TRUE;
++    if (!CryptDecodeObjectEx(X509_ASN_ENCODING, X509_SEQUENCE_OF_ANY,
++     blob->pbData, blob->cbData, CRYPT_DECODE_ALLOC_FLAG, NULL, &fields, &size))
++        goto done;
++    if (!fields->cValue) goto malformed;
++    encoded = &fields->rgValue[fields->cValue - 1];
++    if (encoded->cbData < 2 || encoded->pbData[0] != 0x31) goto malformed;
++
++    /* X509_SEQUENCE_OF_ANY expects a SEQUENCE. Change only our temporary copy
++     * of the signerInfos SET tag; its elements and ordering are unchanged. */
++    encoded->pbData[0] = 0x30;
++    if (!CryptDecodeObjectEx(X509_ASN_ENCODING, X509_SEQUENCE_OF_ANY,
++     encoded->pbData, encoded->cbData, CRYPT_DECODE_ALLOC_FLAG, NULL, &signers, &size))
++        goto done;
++    if (signers->cValue != msg_data->info->cSignerInfo) goto malformed;
++    for (i = 0; i < signers->cValue; ++i)
++    {
++        if (!msg_data->info->rgSignerInfo[i].AuthAttrs.cAttr) continue;
++        encoded = &signers->rgValue[i];
++        if (!CryptDecodeObjectEx(X509_ASN_ENCODING, X509_SEQUENCE_OF_ANY,
++         encoded->pbData, encoded->cbData, CRYPT_DECODE_ALLOC_FLAG, NULL, &signer, &size))
++            goto done;
++        /* SignerInfo: version, signer identifier, digest algorithm, [0] attrs. */
++        if (signer->cValue < 4) goto malformed;
++        encoded = &signer->rgValue[3];
++        if (encoded->cbData < 2 || encoded->pbData[0] != 0xa0) goto malformed;
++        if (!CRYPT_ConstructBlob(&msg_data->signerHandles[i].encodedAuthAttrs, encoded))
++            goto done;
++        msg_data->signerHandles[i].encodedAuthAttrs.pbData[0] = 0x31;
++        LocalFree(signer);
++        signer = NULL;
++    }
++    ret = TRUE;
++    goto done;
++malformed:
++    SetLastError(CRYPT_E_ASN1_CORRUPT);
++done:
++    LocalFree(signer);
++    LocalFree(signers);
++    LocalFree(fields);
++    return ret;
++}
++
+ static void CSignedMsgData_CloseHandles(CSignedMsgData *msg_data)
+ {
+     DWORD i;
+@@ -1040,6 +1096,7 @@
+             CryptDestroyHash(msg_data->signerHandles[i].contentHash);
+         if (msg_data->signerHandles[i].authAttrHash)
+             CryptDestroyHash(msg_data->signerHandles[i].authAttrHash);
++        CryptMemFree(msg_data->signerHandles[i].encodedAuthAttrs.pbData);
+     }
+     CryptMemFree(msg_data->signerHandles);
+     msg_data->signerHandles = NULL;
+@@ -1131,7 +1188,20 @@
+                     ret = CSignedMsgData_AppendMessageDigestAttribute(msg_data,
+                      i);
+             }
+-            if (ret)
++            if (ret && flag == Verify)
++            {
++                const CRYPT_DATA_BLOB *attrs = &msg_data->signerHandles[i].encodedAuthAttrs;
++
++                if (!attrs->pbData)
++                {
++                    SetLastError(CRYPT_E_ASN1_CORRUPT);
++                    ret = FALSE;
++                }
++                else
++                    ret = CryptHashData(msg_data->signerHandles[i].authAttrHash,
++                     attrs->pbData, attrs->cbData, 0);
++            }
++            else if (ret)
+             {
+                 LPBYTE encodedAttrs;
+                 DWORD size;
+@@ -2314,7 +2384,18 @@
+      CRYPT_DECODE_ALLOC_FLAG, NULL, (CRYPT_SIGNED_INFO *)&signedInfo,
+      &size);
+     if (ret)
++    {
+         msg->u.signed_data.info = signedInfo;
++        ret = CSignedMsgData_AllocateHandles(&msg->u.signed_data);
++        if (ret)
++            ret = CSignedMsgData_SaveAuthenticatedAttributes(&msg->u.signed_data, blob);
++        if (!ret)
++        {
++            CSignedMsgData_CloseHandles(&msg->u.signed_data);
++            LocalFree(signedInfo);
++            msg->u.signed_data.info = NULL;
++        }
++    }
+     return ret;
+ }
+ 
+@@ -2441,10 +2522,8 @@
+ static BOOL CDecodeMsg_FinalizeSignedContent(CDecodeMsg *msg,
+  CRYPT_DER_BLOB *blob)
+ {
+-    BOOL ret;
++    BOOL ret = TRUE;
+     DWORD i, size;
+-
+-    ret = CSignedMsgData_AllocateHandles(&msg->u.signed_data);
+     for (i = 0; ret && i < msg->u.signed_data.info->cSignerInfo; i++)
+         ret = CSignedMsgData_ConstructSignerHandles(&msg->u.signed_data, i,
+          &msg->crypt_prov, &msg->base.open_flags);
